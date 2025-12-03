@@ -16,34 +16,37 @@ os.environ['https_proxy'] = ''
 os.environ['all_proxy'] = ''
 
 # --- Configuration ---
-# Tushare Token配置，优先从环境变量获取，否则使用默认值
-TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "ac85143eaf1a537517703687c0596b2a303696345e0162612af7ca9d")
+# Tushare Token配置 (VIP接口)
+TUSHARE_TOKEN = "b0e7q171j0i329i258"
 ts.set_token(TUSHARE_TOKEN)
-pro = ts.pro_api()
+# 设置超时时间为30秒
+pro = ts.pro_api(TUSHARE_TOKEN, timeout=30)
+pro._DataApi__token = TUSHARE_TOKEN
+pro._DataApi__http_url = 'http://pro.tushare.nlink.vip'
 
 # Backtest Parameters (回测参数)
-# 回测时间范围：过去3年到今天
-START_DATE = (datetime.datetime.now() - datetime.timedelta(days=365*8)).strftime('%Y%m%d')
+# 回测时间范围：过去6年到今天
+START_DATE = (datetime.datetime.now() - datetime.timedelta(days=365*6)).strftime('%Y%m%d')
 END_DATE = datetime.datetime.now().strftime('%Y%m%d')
 INITIAL_CASH = 1000000       # 初始资金 100万
 MAX_POSITIONS = 5           # 最大持仓股票数量
 POSITION_SIZE_PCT = 0.20     # 单只股票仓位占比 20%
-HOLD_DAYS = 45               # 持仓天数
+HOLD_DAYS = 20               # 持仓天数
 
 # Stock Filter Parameters (选股过滤参数)
-FILTER_MIN_MARKET_CAP = 400 * 10000 * 10000  # 最小市值 400亿
-FILTER_MIN_PE = 20           # 最小市盈率(TTM)
+FILTER_MIN_MARKET_CAP = 600 * 10000 * 10000  # 最小市值 350亿
+FILTER_MIN_PE = 15           # 最小市盈率(TTM) - 下调至3以包含银行等低估值蓝筹
 FILTER_MAX_PE = 45           # 最大市盈率(TTM)
-FILTER_MIN_PROFIT_YOY = -20  # 净利润同比增长率下限 (%)
+FILTER_MIN_PROFIT_YOY = 15  # 净利润同比增长率下限 (%)
 # FILTER_FINANCIAL_PERIOD removed - will be dynamic (财务周期动态获取)
 
 # Strategy Parameters (策略参数)
 # 买入评分权重：主力吸货(40%) + 风险控制(35%) + 动量涨跌(25%)
-BUY_WEIGHTS = {'s1_main': 0.40, 's2_risk': 0.35, 's3_momentum': 0.25}
+BUY_WEIGHTS = {'s1_main': 0.30, 's2_risk': 0.30, 's3_momentum': 0.40}
 BUY_THRESHOLD = 90           # 买入总分阈值
-STOP_LOSS_PCT = -0.10        # 止损百分比 (-10%)
-TAKE_PROFIT_PCT = 0.25       # 止盈百分比 (25%)
-COOLDOWN_DAYS = 15           # 卖出后冷却天数 (禁止买入刚卖出的股票)
+STOP_LOSS_PCT = -0.05        # 止损百分比 (-12%)
+TAKE_PROFIT_PCT = 0.25       # 止盈百分比 (30%)
+COOLDOWN_DAYS = 14           # 卖出后冷却天数 (禁止买入刚卖出的股票)
 
 # Transaction Cost Parameters (交易成本参数)
 COMMISSION_RATE = 0.0003     # 买卖佣金 0.03%
@@ -60,6 +63,7 @@ CHART_DRAWDOWN_ALPHA = 0.3
 
 # Risk Metrics Parameters (风险指标参数)
 RISK_FREE_RATE = 0.02        # 无风险利率 2%
+REPO_RATE = 0.014            # 国债逆回购年化收益率 1.4%
 
 # --- Helper Functions (Copied from stock_scanner.py) ---
 
@@ -204,19 +208,40 @@ def get_stock_pool(target_date, period):
     print(f"Fetching stock pool for Rebalance Date: {target_date} (Period: {period})...")
     try:
         # 1. 找到目标日期或之前的最近交易日
-        cal = pro.trade_cal(exchange='', start_date='20100101', end_date=target_date, is_open='1')
+        # Optimization: Look back 30 days instead of from 2010 to avoid data issues and improve speed
+        dt_target = datetime.datetime.strptime(target_date, '%Y%m%d')
+        dt_start = dt_target - datetime.timedelta(days=30)
+        start_date_str = dt_start.strftime('%Y%m%d')
+        
+        cal = pro.trade_cal(exchange='', start_date=start_date_str, end_date=target_date, is_open='1')
         if cal.empty:
+            print(f"Warning: No trade calendar found between {start_date_str} and {target_date}")
             return [], {}
+        
+        # Sort by date ascending to ensure iloc[-1] is the latest date
+        cal = cal.sort_values('cal_date')
         last_trade_date = cal.iloc[-1]['cal_date']
         
+        # Check for stale data
+        last_trade_dt = datetime.datetime.strptime(last_trade_date, '%Y%m%d')
+        if (dt_target - last_trade_dt).days > 10:
+             print(f"  ! WARNING: Data might be stale! Last trade date {last_trade_date} is far from target {target_date}")
+
         # 2. 获取该日期的基础指标 (市值, PE)
         df_daily = pro.daily_basic(ts_code='', trade_date=last_trade_date, fields='ts_code,pe_ttm,total_mv')
         if df_daily.empty:
              print(f"Warning: No daily basic data for {last_trade_date}")
              return [], {}
+        
+        # Debug: Print sample data to verify it changes
+        print(f"  > Daily Basic Data for {last_trade_date}:")
+        print(f"    Sample (000001.SZ): {df_daily[df_daily['ts_code']=='000001.SZ'][['pe_ttm', 'total_mv']].to_dict('records')}")
+        print(f"    Total rows: {len(df_daily)}")
 
         # Fetch market info to ensure coverage of Main, ChiNext, STAR
-        df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,market')
+        # CRITICAL FIX: Include Delisted (D) and Paused (P) stocks to avoid Survivorship Bias
+        # 关键修正：包含已退市(D)和暂停上市(P)的股票，避免幸存者偏差
+        df_basic = pro.stock_basic(exchange='', list_status='L,D,P', fields='ts_code,name,market')
         df = pd.merge(df_daily, df_basic, on='ts_code')
         
         # 过滤: 市值 & PE
@@ -239,9 +264,35 @@ def get_stock_pool(target_date, period):
             return [], {}
             
         # 批量获取财务指标
-        df_fina = pro.fina_indicator(ts_code=",".join(codes), period=period, fields='ts_code,dt_netprofit_yoy')
+        # Note: Tushare limit is 1000 codes per request. Chunk if necessary.
+        df_fina_list = []
+        chunk_size = 800 # Safe limit
+        for i in range(0, len(codes), chunk_size):
+            chunk_codes = codes[i:i+chunk_size]
+            try:
+                df_chunk = pro.fina_indicator(ts_code=",".join(chunk_codes), period=period, fields='ts_code,dt_netprofit_yoy')
+                df_fina_list.append(df_chunk)
+            except Exception as e:
+                print(f"  ! Error fetching fina_indicator chunk {i}: {e}")
+        
+        if df_fina_list:
+            df_fina = pd.concat(df_fina_list, ignore_index=True)
+            # Deduplicate: Keep the latest record if multiple exist for same ts_code (though period is same)
+            # Tushare might return multiple records if there are updates.
+            # Usually we want the latest one, but here we don't have publish date.
+            # We can just drop duplicates on ts_code.
+            original_len = len(df_fina)
+            df_fina.drop_duplicates(subset=['ts_code'], keep='last', inplace=True)
+            if len(df_fina) < original_len:
+                print(f"  > Deduplicated financial data: {original_len} -> {len(df_fina)}")
+        else:
+            df_fina = pd.DataFrame()
         
         if not df_fina.empty:
+            # Debug: Print sample financial data
+            print(f"  > Financial Data Sample (First 2):")
+            print(df_fina[['ts_code', 'dt_netprofit_yoy']].head(2).to_string(index=False))
+            
             subset = pd.merge(subset, df_fina, on='ts_code', how='inner')
             print(f"  > After merging financial data: {len(subset)}")
             subset = subset[subset['dt_netprofit_yoy'] > FILTER_MIN_PROFIT_YOY]
@@ -283,19 +334,23 @@ def fetch_all_data(stock_pool, start_date, end_date):
         
         # Tushare pro_bar 接口通常用于单只股票获取复权数据
         for code in chunk:
-            try:
-                df = ts.pro_bar(ts_code=code, adj='qfq', start_date=warmup_start, end_date=end_date)
-                if df is not None and not df.empty:
-                    # 立即计算信号以节省后续内存/处理时间
-                    df_sig = calculate_signals_vectorized(df)
-                    # 设置日期索引并排序
-                    df_sig['trade_date'] = pd.to_datetime(df_sig['trade_date'])
-                    df_sig.set_index('trade_date', inplace=True)
-                    df_sig.sort_index(inplace=True)
-                    data_map[code] = df_sig
-                time.sleep(0.05)
-            except Exception as e:
-                print(f"Error fetching {code}: {e}")
+            for attempt in range(3): # Retry logic
+                try:
+                    # Pass the configured 'pro' API object to ensure VIP URL is used
+                    df = ts.pro_bar(ts_code=code, adj='qfq', start_date=warmup_start, end_date=end_date, api=pro)
+                    if df is not None and not df.empty:
+                        # 立即计算信号以节省后续内存/处理时间
+                        df_sig = calculate_signals_vectorized(df)
+                        # 设置日期索引并排序
+                        df_sig['trade_date'] = pd.to_datetime(df_sig['trade_date'])
+                        df_sig.set_index('trade_date', inplace=True)
+                        df_sig.sort_index(inplace=True)
+                        data_map[code] = df_sig
+                    time.sleep(0.05)
+                    break # Success, exit retry loop
+                except Exception as e:
+                    print(f"Error fetching {code} (Attempt {attempt+1}/3): {e}")
+                    time.sleep(1) # Wait before retry
                 
     return data_map
 
@@ -382,8 +437,10 @@ def run_backtest():
     cash = INITIAL_CASH
     positions = {} # 持仓字典 {ts_code: {'shares': int, 'buy_date': date, 'buy_price': float}}
     history = [] # 每日资产记录
+    daily_stats = [] # 每日详细统计
     trades = [] # 交易记录
     last_sold_info = {} # 记录最近卖出的股票 {code: sell_date}
+    total_repo_profit = 0.0 # 累计逆回购收益
     
     total_signals_triggered = 0
     sorted_pool_dates = sorted(pool_map.keys())
@@ -394,9 +451,12 @@ def run_backtest():
         current_date_str = current_date.strftime('%Y%m%d')
         
         # Determine active pool (确定当前生效的股票池)
+        # Switch to new pool on the day AFTER the rebalance date to avoid look-ahead bias
+        # (Pool is calculated using rebalance date's closing data, so we can only trade it next day)
+        # 关键修正：将 <= 改为 <，确保在调仓日次日才使用新股票池，避免使用当日收盘数据交易当日开盘
         active_pool_date = sorted_pool_dates[0]
         for d in sorted_pool_dates:
-            if d <= current_date_str:
+            if d < current_date_str: 
                 active_pool_date = d
             else:
                 break
@@ -577,6 +637,17 @@ def run_backtest():
                     code = cand['code']
                     df = data_map.get(code)
                     if df is not None and current_date in df.index:
+                        # Check for Limit Up/Down (涨跌停检查)
+                        # If High == Low, it's a one-bar limit move (likely un-tradeable)
+                        # 如果全天最高价等于最低价，说明是一字板，无法交易
+                        day_high = df.loc[current_date, 'H']
+                        day_low = df.loc[current_date, 'L']
+                        if isinstance(day_high, pd.Series): day_high = day_high.iloc[0]
+                        if isinstance(day_low, pd.Series): day_low = day_low.iloc[0]
+                        
+                        if day_high == day_low:
+                            continue # Skip trade (Limit Up/Down)
+
                         buy_price = df.loc[current_date, 'O']
                         # Handle potential duplicate index or Series return (处理可能的重复索引或Series返回)
                         if isinstance(buy_price, pd.Series):
@@ -584,6 +655,23 @@ def run_backtest():
                             
                         if np.isnan(buy_price): continue
                         
+                        # Check if Open is Limit Up (Approximate check: > 9.5% from prev close)
+                        # 检查开盘是否涨停 (近似检查: 较昨收涨幅 > 9.5%)
+                        # We need prev close.
+                        prev_close = df.loc[current_date, 'pre_close'] if 'pre_close' in df.columns else None
+                        if prev_close is None:
+                             # Try to get from prev row
+                             idx_loc = df.index.get_loc(current_date)
+                             if idx_loc > 0:
+                                 prev_close = df.iloc[idx_loc-1]['C']
+                        
+                        if prev_close is not None:
+                            if isinstance(prev_close, pd.Series): prev_close = prev_close.iloc[0]
+                            if prev_close > 0:
+                                open_pct = (buy_price - prev_close) / prev_close
+                                if open_pct > 0.095: # Limit Up at Open
+                                    continue
+
                         # Calculate shares (round to 100) (计算股数，向下取整到100股)
                         # Adjust buy_price for slippage to check affordability
                         est_buy_price = buy_price * (1 + SLIPPAGE_RATE)
@@ -599,34 +687,38 @@ def run_backtest():
                             if cash >= total_cost:
                                 cash -= total_cost
                                 
-                            # Estimate equity for logging
-                            pos_pct = total_cost / current_total_equity if current_total_equity > 0 else 0
-                            
-                            stock_info = stock_info_map.get(code, {'name': code, 'market': 'Unknown'})
-                            positions[code] = {
-                                'shares': shares,
-                                'buy_date': current_date,
-                                'buy_price': buy_price, # Store raw price for reference
-                                'total_cost': total_cost, # Store total cost for profit calc
-                                'name': stock_info['name'],
-                                'market': stock_info['market'],
-                                'pos_pct': pos_pct
-                            }
-                            trades.append({
-                                'date': current_date,
-                                'code': code,
-                                'name': stock_info['name'],
-                                'market': stock_info['market'],
-                                'action': 'BUY',
-                                'price': buy_price,
-                                'exec_price': round(actual_buy_price, 2),
-                                'shares': shares,
-                                'amount': round(raw_cost, 2),
-                                'commission': round(commission, 2),
-                                'total_cost': round(total_cost, 2),
-                                'pos_pct': f"{pos_pct*100:.1f}%",
-                                'score': cand['score']
-                            })
+                                # Estimate equity for logging
+                                pos_pct = total_cost / current_total_equity if current_total_equity > 0 else 0
+                                
+                                stock_info = stock_info_map.get(code, {'name': code, 'market': 'Unknown'})
+                                positions[code] = {
+                                    'shares': shares,
+                                    'buy_date': current_date,
+                                    'buy_price': buy_price, # Store raw price for reference
+                                    'total_cost': total_cost, # Store total cost for profit calc
+                                    'name': stock_info['name'],
+                                    'market': stock_info['market'],
+                                    'pos_pct': pos_pct
+                                }
+                                trades.append({
+                                    'date': current_date,
+                                    'code': code,
+                                    'name': stock_info['name'],
+                                    'market': stock_info['market'],
+                                    'action': 'BUY',
+                                    'price': buy_price,
+                                    'exec_price': round(actual_buy_price, 2),
+                                    'shares': shares,
+                                    'amount': round(raw_cost, 2),
+                                    'commission': round(commission, 2),
+                                    'total_cost': round(total_cost, 2),
+                                    'pos_pct': f"{pos_pct*100:.1f}%",
+                                    'score': cand['score']
+                                })
+                            else:
+                                # Insufficient cash (due to commission/rounding), skip or adjust
+                                # For now, just skip to avoid "Free Stock" bug
+                                continue
 
         except ValueError:
             pass
@@ -659,12 +751,36 @@ def run_backtest():
                 # Get price
                 df = data_map.get(code)
                 if df is not None and current_date in df.index:
+                    # Check for Limit Up/Down (涨跌停检查)
+                    day_high = df.loc[current_date, 'H']
+                    day_low = df.loc[current_date, 'L']
+                    if isinstance(day_high, pd.Series): day_high = day_high.iloc[0]
+                    if isinstance(day_low, pd.Series): day_low = day_low.iloc[0]
+                    
+                    if day_high == day_low:
+                        continue # Cannot sell (Limit Down likely)
+
                     # Sell at Open (以开盘价卖出)
                     sell_price = df.loc[current_date, 'O']
                     # Handle potential duplicate index or Series return
                     if isinstance(sell_price, pd.Series):
                         sell_price = sell_price.iloc[0]
                     
+                    # Check if Open is Limit Down (Approximate check: < -9.5% from prev close)
+                    # 检查开盘是否跌停
+                    prev_close = df.loc[current_date, 'pre_close'] if 'pre_close' in df.columns else None
+                    if prev_close is None:
+                            idx_loc = df.index.get_loc(current_date)
+                            if idx_loc > 0:
+                                prev_close = df.iloc[idx_loc-1]['C']
+                    
+                    if prev_close is not None:
+                        if isinstance(prev_close, pd.Series): prev_close = prev_close.iloc[0]
+                        if prev_close > 0:
+                            open_pct = (sell_price - prev_close) / prev_close
+                            if open_pct < -0.095: # Limit Down at Open
+                                continue # Cannot sell
+
                     # Apply Slippage
                     actual_sell_price = sell_price * (1 - SLIPPAGE_RATE)
                     revenue = pos['shares'] * actual_sell_price
@@ -706,6 +822,15 @@ def run_backtest():
                     
                     del positions[code]
 
+        # --- D. Reverse Repo (国债逆回购) ---
+        # Calculate interest on idle cash (conservative 1.4% annualized)
+        # Only on trading days, assuming 1 day interest per trading day
+        # 仅对剩余资金进行操作，不影响次日交易
+        if cash > 1000: # Minimum threshold (最小起投金额)
+            daily_repo_interest = cash * REPO_RATE / 365
+            cash += daily_repo_interest
+            total_repo_profit += daily_repo_interest
+
         # --- C. Update Equity (更新账户净值) ---
         market_value = 0
         for code, pos in positions.items():
@@ -725,6 +850,15 @@ def run_backtest():
             'equity': total_equity,
             'cash': cash,
             'positions': len(positions)
+        })
+        
+        daily_stats.append({
+            'date': current_date,
+            'total_equity': total_equity,
+            'cash': cash,
+            'market_value': market_value,
+            'positions_count': len(positions),
+            'repo_profit': total_repo_profit
         })
 
     # --- 5. Analysis & Plotting (分析与绘图) ---
@@ -871,6 +1005,10 @@ def run_backtest():
     print(f"Total Return:    {total_return*100:.2f}%")
     print(f"Annualized Ret:  {annualized_return*100:.2f}%")
     print(f"Max Drawdown:    {max_dd*100:.2f}%")
+    print("-" * 40)
+    print(f"Stock Profit:    {(final_equity - INITIAL_CASH - total_repo_profit):,.2f}")
+    print(f"Repo Profit:     {total_repo_profit:,.2f} (Risk-free)")
+    print("-" * 40)
     print(f"Sharpe Ratio:    {sharpe:.2f}")
     print(f"Sortino Ratio:   {sortino:.2f}")
     print("-" * 40)
@@ -888,7 +1026,7 @@ def run_backtest():
     print("="*40)
 
     # --- Plotting (绘图) ---
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 16), sharex=True, gridspec_kw={'height_ratios': [3, 1, 1]})
     
     # 1. Strategy Equity (Normalized to 1) (策略净值 - 归一化为1)
     df_res['norm_equity'] = df_res['equity'] / INITIAL_CASH
@@ -896,6 +1034,8 @@ def run_backtest():
     
     # 2. Benchmarks (Normalized to 1) (基准指数 - 归一化为1)
     colors = {'CSI 300': '#ff7f0e', 'Shanghai Composite': '#2ca02c', 'CSI 1000': '#d62728'}
+    csi300_norm = None
+    
     for name, df_bench in benchmark_data.items():
         # Align dates (对齐日期)
         common_dates = df_res.index.intersection(df_bench.index)
@@ -905,6 +1045,11 @@ def run_backtest():
             # Normalize to start at 1 (归一化为1)
             bench_norm = bench_series / bench_series.iloc[0]
             ax1.plot(common_dates, bench_norm, label=name, linestyle='--', alpha=0.7, linewidth=1.5, color=colors.get(name, 'gray'))
+            
+            if name == 'CSI 300':
+                # Prepare CSI 300 norm for excess return calculation
+                # Reindex to match df_res for subtraction, filling missing with NaN or ffill
+                csi300_norm = bench_norm.reindex(df_res.index, method='ffill')
 
     # 3. Highlight Max Drawdown Interval (Peak to Trough) (高亮最大回撤区间 - 峰值到谷底)
     ax1.axvspan(max_dd_start_date, max_dd_end_date, color=CHART_DRAWDOWN_COLOR, alpha=CHART_DRAWDOWN_ALPHA, label=f'Max Drawdown {max_dd*100:.2f}%')
@@ -923,12 +1068,75 @@ def run_backtest():
     ax1.grid(True, which='both', linestyle='--', alpha=0.5)
     ax1.legend(loc='upper left', fontsize=CHART_FONT_SIZE_LEGEND)
     
-    # 4. Net Asset Bar Chart (Bottom Subplot) (净资产柱状图 - 底部子图)
-    ax2.bar(df_res.index, df_res['equity'], color='#1f77b4', alpha=0.6, width=1.0)
-    ax2.set_ylabel('Net Asset Value', fontsize=CHART_FONT_SIZE_LABEL)
-    ax2.set_xlabel('Date', fontsize=CHART_FONT_SIZE_LABEL)
-    ax2.tick_params(axis='both', labelsize=CHART_FONT_SIZE_TICK)
-    ax2.grid(True, which='both', linestyle='--', alpha=0.5)
+    # 4. Excess Return Chart (Middle Subplot) (超额收益图 - 中间子图)
+    if csi300_norm is not None:
+        excess_ret = df_res['norm_equity'] - csi300_norm
+        ax2.plot(df_res.index, excess_ret, label='Excess Return vs CSI 300', color='purple', linewidth=1.5)
+        ax2.fill_between(df_res.index, excess_ret, 0, where=(excess_ret>=0), facecolor='purple', alpha=0.3)
+        ax2.fill_between(df_res.index, excess_ret, 0, where=(excess_ret<0), facecolor='gray', alpha=0.3)
+        
+        # Calculate Max Drawdown for Excess Return (计算超额收益的最大回撤)
+        # We treat excess return curve as an asset curve to find its drawdown
+        # Since excess return can be negative, we add a constant (e.g. 1) to make it a price series starting at 1
+        # Or simply find the max drop from peak in the absolute value series
+        
+        # Construct a synthetic equity curve for excess return: 1 + excess_ret
+        # This represents the relative performance wealth index
+        excess_equity = 1 + excess_ret
+        excess_peak = excess_equity.cummax()
+        excess_dd = (excess_equity - excess_peak) / excess_peak
+        max_excess_dd = excess_dd.min()
+        
+        max_excess_dd_end_date = excess_dd.idxmin()
+        peak_val_at_excess_dd = excess_peak.loc[max_excess_dd_end_date]
+        
+        # Find start date
+        temp_excess_df = pd.DataFrame({'equity': excess_equity, 'peak': excess_peak})
+        temp_excess_df = temp_excess_df.loc[:max_excess_dd_end_date]
+        max_excess_dd_start_date = temp_excess_df[temp_excess_df['equity'] >= peak_val_at_excess_dd].index[-1]
+        
+        # Highlight Excess Return Drawdown
+        ax2.axvspan(max_excess_dd_start_date, max_excess_dd_end_date, color=CHART_DRAWDOWN_COLOR, alpha=CHART_DRAWDOWN_ALPHA, label=f'Max Excess DD {max_excess_dd*100:.2f}%')
+        
+        # Annotate
+        mid_date = max_excess_dd_start_date + (max_excess_dd_end_date - max_excess_dd_start_date) / 2
+        ax2.text(mid_date, excess_ret.loc[max_excess_dd_end_date], f"Max DD: {max_excess_dd*100:.2f}%", 
+                 color='red', fontsize=10, ha='center', va='top', fontweight='bold')
+
+        ax2.set_ylabel('Excess Return', fontsize=CHART_FONT_SIZE_LABEL)
+        ax2.grid(True, which='both', linestyle='--', alpha=0.5)
+        ax2.legend(loc='upper left', fontsize=CHART_FONT_SIZE_LEGEND)
+    else:
+        ax2.text(0.5, 0.5, 'CSI 300 Data Not Available', horizontalalignment='center', verticalalignment='center', transform=ax2.transAxes)
+
+    # 5. Net Asset Area Chart (Bottom Subplot) (净资产面积图 - 底部子图)
+    ax3.plot(df_res.index, df_res['equity'], color='#1f77b4', linewidth=1.5)
+    ax3.fill_between(df_res.index, df_res['equity'], 0, color='lightblue', alpha=0.4)
+    
+    # Annotate Min/Max Equity (标注最低/最高资产)
+    min_equity = df_res['equity'].min()
+    max_equity = df_res['equity'].max()
+    min_date = df_res['equity'].idxmin()
+    max_date = df_res['equity'].idxmax()
+    
+    ax3.annotate(f'Min: {min_equity:,.0f}', xy=(min_date, min_equity), 
+                 xytext=(0, -20), textcoords='offset points',
+                 arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=.2", color='green'),
+                 fontsize=10, ha='center', color='green', fontweight='bold')
+                 
+    ax3.annotate(f'Max: {max_equity:,.0f}', xy=(max_date, max_equity), 
+                 xytext=(0, 20), textcoords='offset points',
+                 arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=.2", color='red'),
+                 fontsize=10, ha='center', color='red', fontweight='bold')
+
+    ax3.set_ylabel('Net Asset Value', fontsize=CHART_FONT_SIZE_LABEL)
+    ax3.set_xlabel('Date', fontsize=CHART_FONT_SIZE_LABEL)
+    ax3.tick_params(axis='both', labelsize=CHART_FONT_SIZE_TICK)
+    ax3.grid(True, which='both', linestyle='--', alpha=0.5)
+    
+    # Adjust Y-axis to focus on the data range but keep the "area" feel
+    y_min_limit = min(INITIAL_CASH, min_equity) * 0.85
+    ax3.set_ylim(bottom=y_min_limit)
     
     # Add text box with key stats (Simplified since title has most) (添加关键统计数据文本框)
     stats_text = (
@@ -941,6 +1149,11 @@ def run_backtest():
     plt.tight_layout()
     plt.savefig('backtest_result.png', dpi=300)
     print("Chart saved to backtest_result.png")
+    
+    # Save daily stats
+    if daily_stats:
+        pd.DataFrame(daily_stats).to_csv('backtest_daily.csv', index=False)
+        print("Daily stats saved to backtest_daily.csv")
     
     # Save trades (保存交易记录)
     if not df_trades.empty:
