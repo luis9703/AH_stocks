@@ -122,25 +122,38 @@ def calculate_indicator(df):
 def get_a_stocks():
     """获取A股列表并进行基本面初筛"""
     print("Fetching A-share fundamental data...")
-    # 获取实时行情，包含总市值、PE、PB等
-    df = ak.stock_zh_a_spot_em()
     
-    # 过滤条件
-    # 1. 市值 > 200亿 (总市值字段通常是 '总市值')
-    # 2. 5 < PE(TTM) < 100 (字段: '市盈率-动态') *注意：akshare字段名可能变化，需核对
-    # 3. 这里的API可能不直接包含负债率，负债率需要额外接口，为加速，先筛选市值和PE
-    
-    # 字段映射 (根据 akshare 最新输出调整)
-    # 假设字段: 代码, 名称, 最新价, ..., 总市值, 市盈率-动态, 市净率
-    
-    subset = df[
-        (df['总市值'] >= MIN_MARKET_CAP) & 
-        (df['市盈率-动态'] >= MIN_PE) & 
-        (df['市盈率-动态'] <= MAX_PE)
-    ].copy()
-    
-    print(f"A-shares passed fundamental filter (Cap & PE): {len(subset)}")
-    return subset
+    # --- 新增：重试机制 ---
+    # GitHub Actions 在海外，连接国内接口容易断开，增加重试可以大幅提高稳定性
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            # 获取实时行情，包含总市值、PE、PB等
+            df = ak.stock_zh_a_spot_em()
+            
+            # 过滤条件
+            # 1. 市值 > 200亿 (总市值字段通常是 '总市值')
+            # 2. 5 < PE(TTM) < 100 (字段: '市盈率-动态')
+            
+            subset = df[
+                (df['总市值'] >= MIN_MARKET_CAP) & 
+                (df['市盈率-动态'] >= MIN_PE) & 
+                (df['市盈率-动态'] <= MAX_PE)
+            ].copy()
+            
+            print(f"A-shares passed fundamental filter (Cap & PE): {len(subset)}")
+            return subset
+
+        except Exception as e:
+            print(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                wait_time = 15  # 失败后等待15秒再试
+                print(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                print("Max retries reached. Failed to fetch A-share list.")
+                # 如果彻底失败，返回空DataFrame，避免脚本崩溃
+                return pd.DataFrame()
 
 def check_financials(symbol):
     """
