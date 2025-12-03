@@ -23,27 +23,27 @@ pro = ts.pro_api()
 
 # Backtest Parameters (回测参数)
 # 回测时间范围：过去3年到今天
-START_DATE = (datetime.datetime.now() - datetime.timedelta(days=365*3)).strftime('%Y%m%d')
+START_DATE = (datetime.datetime.now() - datetime.timedelta(days=365*5)).strftime('%Y%m%d')
 END_DATE = datetime.datetime.now().strftime('%Y%m%d')
 INITIAL_CASH = 2000000       # 初始资金 200万
-MAX_POSITIONS = 20           # 最大持仓股票数量
-POSITION_SIZE_PCT = 0.05     # 单只股票仓位占比 5%
-HOLD_DAYS = 40               # 持仓天数
+MAX_POSITIONS = 5           # 最大持仓股票数量
+POSITION_SIZE_PCT = 0.20     # 单只股票仓位占比 5%
+HOLD_DAYS = 45               # 持仓天数
 
 # Stock Filter Parameters (选股过滤参数)
 FILTER_MIN_MARKET_CAP = 400 * 10000 * 10000  # 最小市值 400亿
-FILTER_MIN_PE = 10           # 最小市盈率(TTM)
-FILTER_MAX_PE = 60           # 最大市盈率(TTM)
-FILTER_MIN_PROFIT_YOY = -25  # 净利润同比增长率下限 (%)
+FILTER_MIN_PE = 5           # 最小市盈率(TTM)
+FILTER_MAX_PE = 90           # 最大市盈率(TTM)
+FILTER_MIN_PROFIT_YOY = -20  # 净利润同比增长率下限 (%)
 # FILTER_FINANCIAL_PERIOD removed - will be dynamic (财务周期动态获取)
 
 # Strategy Parameters (策略参数)
 # 买入评分权重：主力吸货(40%) + 风险控制(35%) + 动量涨跌(25%)
 BUY_WEIGHTS = {'s1_main': 0.40, 's2_risk': 0.35, 's3_momentum': 0.25}
-BUY_THRESHOLD = 80           # 买入总分阈值
-STOP_LOSS_PCT = -0.04        # 止损百分比 (-4%)
-TAKE_PROFIT_PCT = 0.16       # 止盈百分比 (16%)
-COOLDOWN_DAYS = 5           # 卖出后冷却天数 (禁止买入刚卖出的股票)
+BUY_THRESHOLD = 90           # 买入总分阈值
+STOP_LOSS_PCT = -0.10        # 止损百分比 (-10%)
+TAKE_PROFIT_PCT = 0.25       # 止盈百分比 (25%)
+COOLDOWN_DAYS = 10           # 卖出后冷却天数 (禁止买入刚卖出的股票)
 
 # Chart Parameters (图表参数)
 CHART_FONT_SIZE_TITLE = 20
