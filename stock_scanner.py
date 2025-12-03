@@ -24,7 +24,8 @@ os.environ['all_proxy'] = ''
 TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "ac85143eaf1a537517703687c0596b2a303696345e0162612af7ca9d") # 请替换为你的 Tushare Token
 
 # 微信推送 (PushPlus)
-PUSHPLUS_TOKEN = os.environ.get("7b4ee9c6a01c42009c59e7b1e193b108")  # 你的PushPlus Token
+# 优先从环境变量获取，如果没有则使用默认值（请替换为您的真实Token）
+PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "7b4ee9c6a01c42009c59e7b1e193b108")
 
 # 邮件推送配置
 SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.qq.com")
@@ -34,103 +35,163 @@ EMAIL_PASS = os.environ.get("EMAIL_PASS")       # 邮箱授权码
 EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER") # 收件人邮箱
 
 # 选股硬性指标
-MIN_MARKET_CAP = 200 * 10000 * 10000  # 200亿
-MIN_PE = 5
-MAX_PE = 100
-MAX_DEBT_RATIO = 60 # 负债率 60%
+MIN_MARKET_CAP = 1000 * 10000 * 10000  # 200亿
+MIN_PE = 10
+MAX_PE = 30
+MAX_DEBT_RATIO = 55 # 负债率 60%
 
-# --- 指标计算辅助函数 ---
+# 技术分析参数
+BUY_WEIGHTS = {'s1_main': 0.40, 's2_risk': 0.35, 's3_momentum': 0.25}
+BUY_THRESHOLD = 80
+# 增加回溯天数：周线计算需要至少90个周期(90周≈630天)，加上节假日和缓冲，建议设置为1500天(约4年)
+SCAN_LOOKBACK_DAYS = 1500  
+API_CHUNK_SIZE = 50       # 财务数据批量获取大小
 
-def calc_sma(series, n, m):
+# --- 指标计算辅助函数 (源自 具体量化逻辑.py) ---
+
+def sma_cn(series, n, m):
     """
     模拟同花顺 SMA 算法: Y = (M*X + (N-M)*Y')/N
     """
-    result = []
-    y_prev = 0 # 初始值，通常取序列第一个值或0，这里为了平滑取0或由于SMA特性随时间收敛
-    # 为了准确模拟，通常第一项设为 series[0]
-    if len(series) > 0:
-        y_prev = series.iloc[0]
-    
-    for x in series:
-        y = (m * x + (n - m) * y_prev) / n
-        result.append(y)
-        y_prev = y
-    return pd.Series(result, index=series.index)
+    return series.ewm(alpha=m/n, adjust=True).mean()
 
-def calculate_indicator(df):
+def calculate_technical_signals(df):
     """
-    计算用户提供的同花顺指标
+    计算技术指标和评分 (日线/周线通用)
+    返回: (是否触发买入, 买入分数, 信号详情字符串)
     """
+    if df is None or len(df) < 90:
+        return False, 0, ""
+
     try:
-        # 确保数据够长，至少需要90天数据计算 LLV(LOW, 90)
-        if len(df) < 90:
-            return False, 0
-
-        # 数据清洗
-        close = df['close']
-        low = df['low']
-        high = df['high']
-
-        # VAR1:=REF(LOW,1);
-        var1 = low.shift(1)
-
-        # VAR2:=SMA(ABS(LOW-VAR1),3,1)/SMA(MAX(LOW-VAR1,0),3,1)*100;
-        abs_diff = (low - var1).abs()
-        max_diff = (low - var1).clip(lower=0)
+        # 1. 预处理
+        # Tushare pro_bar 返回列: ts_code, trade_date, open, high, low, close, pre_close, change, pct_chg, vol, amount
+        df = df.copy()
+        # 确保列名匹配逻辑 (C, L, H, O)
+        if 'close' in df.columns:
+            df.rename(columns={'close': 'C', 'low': 'L', 'high': 'H', 'open': 'O'}, inplace=True)
         
-        sma_abs = calc_sma(abs_diff, 3, 1)
-        sma_max = calc_sma(max_diff, 3, 1)
+        # 确保按日期升序 (旧->新)
+        df = df.sort_values('trade_date').reset_index(drop=True)
+
+        # 2. 指标计算
+        # VAR1:=REF(LOW,1)
+        VAR1 = df['L'].shift(1)
         
-        # 避免除以0
-        var2 = (sma_abs / sma_max.replace(0, 0.0001)) * 100
-
-        # VAR3:=EMA(IF(CLOSE*1.2,VAR2*10,VAR2/10),3);
-        # 逻辑说明: CLOSE*1.2 只要收盘价不为0恒为真。在同花顺中 IF(A, B, C) 若A为真返回B。
-        # 绝大多数情况 Close*1.2 都是真，所以取 VAR2 * 10
-        # EMA 在 Pandas 中用 ewm(span=N, adjust=False).mean() 近似，或 alpha=2/(N+1)
-        var3_input = var2 * 10 
-        var3 = var3_input.ewm(span=3, adjust=False).mean()
-
-        # VAR4:=LLV(LOW,38);
-        var4 = low.rolling(window=38).min()
-
-        # VAR5:=HHV(VAR3,38);
-        var5 = var3.rolling(window=38).max()
-
-        # VAR6:=IF(LLV(LOW,90),1,0); 只要有数据就是1
-        var6 = 1
-
-        # VAR7:=EMA(IF(LOW<=VAR4,(VAR3+VAR5*2)/2,0),3)/618*VAR6;
-        # 判断 LOW <= VAR4
-        condition = low <= var4
-        # 如果满足条件，取 (VAR3 + VAR5*2)/2，否则取 0
-        input_for_var7 = pd.Series(0, index=df.index)
-        input_for_var7[condition] = (var3 + var5 * 2) / 2
+        # SMA(ABS(LOW-VAR1),3,1) / SMA(MAX(LOW-VAR1,0),3,1) * 100
+        sma_abs = sma_cn(abs(df['L'] - VAR1), 3, 1)
+        sma_max = sma_cn(np.maximum(df['L'] - VAR1, 0), 3, 1)
+        VAR2 = (sma_abs / sma_max) * 100
+        VAR2.fillna(0, inplace=True)
         
-        var7_ema = input_for_var7.ewm(span=3, adjust=False).mean()
-        var7 = (var7_ema / 618) * var6
-
-        # VAR8:=((C-LLV(L,21))/(HHV(H,21)-LLV(L,21)))*100;
-        # VAR9:=SMA(VAR8,13,8);
-        # 风险:CEILING(SMA(VAR9,13,8))
-        # 涨跌: ... (虽然用户给了公式，但主要触发点是“主力吸货”)
-
-        # --- 信号判断 ---
-        # 逻辑：昨天（iloc[-1]）或者最近几天出现了“主力吸货”信号 (VAR7 > 0.1)
-        # 考虑到“吸货”是一个区间，我们检测昨天是否有吸筹动作
-        last_val = var7.iloc[-1]
+        # VAR3:=EMA(IF(CLOSE*1.2,VAR2*10,VAR2/10),3) -> 简化为 VAR2*10
+        VAR3 = (VAR2 * 10).ewm(span=3, adjust=False).mean()
         
-        # 这里的阈值 0.1 是经验值，VAR7 > 0 即代表有红柱子
-        if last_val > 0.1: 
-            return True, round(last_val, 2)
+        # VAR4:=LLV(LOW,38)
+        VAR4 = df['L'].rolling(38).min()
         
-        return False, 0
+        # VAR5:=HHV(VAR3,38)
+        VAR5 = VAR3.rolling(38).max()
+        
+        # VAR6:=IF(LLV(LOW,90),1,0) -> 1 (只要有数据)
+        VAR6 = 1
+        
+        # VAR7:=EMA(IF(LOW<=VAR4,(VAR3+VAR5*2)/2,0),3)/618*VAR6
+        condition_var7 = df['L'] <= VAR4
+        val_if_true = (VAR3 + VAR5 * 2) / 2
+        ema_base = np.where(condition_var7, val_if_true, 0)
+        VAR7 = pd.Series(ema_base, index=df.index).ewm(span=3, adjust=False).mean() / 618 * VAR6
+        df['主力吸货'] = VAR7
+        
+        # VAR8:=((C-LLV(L,21))/(HHV(H,21)-LLV(L,21)))*100
+        llv_21 = df['L'].rolling(21).min()
+        hhv_21 = df['H'].rolling(21).max()
+        range_21 = hhv_21 - llv_21
+        VAR8 = np.where(range_21 > 0, (df['C'] - llv_21) / range_21 * 100, 0)
+        
+        # VAR9:=SMA(VAR8,13,8)
+        VAR9 = sma_cn(pd.Series(VAR8, index=df.index), 13, 8)
+        df['风险'] = np.ceil(sma_cn(VAR9, 13, 8))
+        
+        # 涨跌 (类似 KDJ J值)
+        llv_27 = df['L'].rolling(27).min()
+        hhv_27 = df['H'].rolling(27).max()
+        range_27 = hhv_27 - llv_27
+        k_stoch_27 = np.where(range_27 > 0, (df['C'] - llv_27) / range_27 * 100, 0)
+        sma1 = sma_cn(pd.Series(k_stoch_27, index=df.index), 5, 1)
+        sma2 = sma_cn(sma1, 3, 1)
+        inner_calc = 3 * sma1 - 2 * sma2
+        df['涨跌'] = inner_calc.rolling(5).mean()
+        
+        # 3. 评分系统
+        # 使用全局参数
+        buy_weights = BUY_WEIGHTS
+        buy_threshold = BUY_THRESHOLD
+        
+        # 主力吸货分数
+        score1 = np.zeros(len(df))
+        base_cond = df['主力吸货'] > 0
+        cont_cond = (df['主力吸货'] > df['主力吸货'].shift(1)) & (df['主力吸货'].shift(1) > df['主力吸货'].shift(2))
+        strength_cond = df['主力吸货'] > df['主力吸货'].rolling(20).mean()
+        
+        score1[base_cond] += 50
+        score1[cont_cond] += 30
+        score1[strength_cond] += 20
+        df['主力吸货分数'] = score1
+        
+        # 风险分数
+        score2 = np.zeros(len(df))
+        score2[df['风险'] < 20] = 100
+        score2[(df['风险'] >= 20) & (df['风险'] < 50)] = 70
+        score2[(df['风险'] >= 50) & (df['风险'] < 80)] = 30
+        df['风险分数'] = score2
+        
+        # 涨跌分数
+        score3 = np.zeros(len(df))
+        score3[(df['涨跌'] > 0) & (df['涨跌'] > df['涨跌'].shift(1))] = 100
+        score3[(df['涨跌'] > 0) & (df['涨跌'] <= df['涨跌'].shift(1))] = 50
+        df['涨跌分数'] = score3
+        
+        df['买入总分'] = (df['主力吸货分数'] * buy_weights['s1_main'] + 
+                         df['风险分数'] * buy_weights['s2_risk'] + 
+                         df['涨跌分数'] * buy_weights['s3_momentum'])
+        
+        # 4. 判断最新信号 (只看最后一行)
+        last_idx = df.index[-1]
+        last_score = df.loc[last_idx, '买入总分']
+        
+        if last_score >= buy_threshold:
+            info = f"总分:{last_score:.1f} (主力:{df.loc[last_idx, '主力吸货分数']:.0f}, 风险:{df.loc[last_idx, '风险分数']:.0f}, 涨跌:{df.loc[last_idx, '涨跌分数']:.0f})"
+            return True, last_score, info
+            
+        return False, last_score, ""
 
     except Exception as e:
-        print(f"Error calculating indicator: {e}")
-        return False, 0
+        # print(f"Error calculating indicator: {e}")
+        return False, 0, ""
 
 # --- 数据获取与筛选 ---
+
+def get_financial_data(pro, ts_code_list, period):
+    """批量获取财务数据"""
+    df_list = []
+    chunk_size = API_CHUNK_SIZE
+    print(f"Fetching financial data for {len(ts_code_list)} stocks (Period: {period})...")
+    
+    for i in range(0, len(ts_code_list), chunk_size):
+        chunk = ts_code_list[i:i+chunk_size]
+        codes = ",".join(chunk)
+        try:
+            # dt_netprofit_yoy: 扣非净利润同比增长率
+            df = pro.fina_indicator(ts_code=codes, period=period, fields='ts_code,dt_netprofit_yoy')
+            df_list.append(df)
+            time.sleep(0.1) # 避免频控
+        except Exception as e:
+            print(f"Error fetching financial data for chunk {i}: {e}")
+    
+    if df_list:
+        return pd.concat(df_list)
+    return pd.DataFrame()
 
 def get_a_stocks():
     """获取A股列表并进行基本面初筛 (Tushare版)"""
@@ -141,10 +202,10 @@ def get_a_stocks():
         pro = ts.pro_api()
         
         # 1. 获取最新交易日
-        # 获取过去30天内的交易日历，取最后一个
-        today = datetime.datetime.now().strftime('%Y%m%d')
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime('%Y%m%d')
-        cal = pro.trade_cal(exchange='', start_date=start_date, end_date=today, is_open='1')
+        today = datetime.datetime.now()
+        today_str = today.strftime('%Y%m%d')
+        start_date = (today - datetime.timedelta(days=30)).strftime('%Y%m%d')
+        cal = pro.trade_cal(exchange='', start_date=start_date, end_date=today_str, is_open='1')
         
         if cal.empty:
             print("No trade calendar found.")
@@ -154,7 +215,6 @@ def get_a_stocks():
         print(f"Latest trade date: {last_trade_date}")
 
         # 2. 获取每日指标 (PE, 市值)
-        # total_mv 单位是万元
         df_daily = pro.daily_basic(ts_code='', trade_date=last_trade_date, fields='ts_code,pe_ttm,total_mv')
         
         # 3. 获取股票基础信息 (名称)
@@ -163,15 +223,41 @@ def get_a_stocks():
         # 4. 合并
         df = pd.merge(df_daily, df_basic, on='ts_code')
         
-        # 5. 过滤
-        # MIN_MARKET_CAP 是绝对值(元)，total_mv 是万元，所以 total_mv * 10000
+        # 5. 初步过滤 (PE & 市值)
         subset = df[
             (df['total_mv'] * 10000 >= MIN_MARKET_CAP) & 
             (df['pe_ttm'] >= MIN_PE) & 
             (df['pe_ttm'] <= MAX_PE)
         ].copy()
         
-        print(f"A-shares passed fundamental filter (Cap & PE): {len(subset)}")
+        print(f"Stocks passed PE & Cap filter: {len(subset)}")
+        
+        if subset.empty:
+            return subset
+
+        # 6. 增加财务筛选 (扣非净利润正增长)
+        # 计算最近的报告期
+        year = today.year
+        if today.month <= 4:
+            period = f"{year-1}1231" # 去年年报
+        elif today.month <= 8:
+            period = f"{year}0331" # 一季报
+        elif today.month <= 10:
+            period = f"{year}0630" # 中报
+        else:
+            period = f"{year}0930" # 三季报
+            
+        df_fina = get_financial_data(pro, subset['ts_code'].tolist(), period)
+        
+        if not df_fina.empty:
+            # 合并财务数据
+            subset = pd.merge(subset, df_fina, on='ts_code', how='inner')
+            # 筛选 dt_netprofit_yoy > 0
+            subset = subset[subset['dt_netprofit_yoy'] > 0].copy()
+            print(f"Stocks passed Financial filter (Positive Growth): {len(subset)}")
+        else:
+            print("Warning: No financial data fetched. Skipping financial filter.")
+
         return subset
 
     except Exception as e:
@@ -191,26 +277,25 @@ def check_financials(symbol):
         return False
 
 def run_scanner():
-    results = []
+    daily_picks = []
+    weekly_picks = []
     
     # 1. 获取 A 股符合基本面的列表
     a_stocks = get_a_stocks()
     
     if a_stocks.empty:
         print("No stocks found in fundamental scan.")
-        return []
+        return [], []
 
-    # 2. 遍历列表获取K线并计算
+    # 2. 遍历列表
     process_list = a_stocks
-    
     print(f"Starting technical scan for {len(process_list)} stocks...")
     
-    # 准备 Tushare 接口
     ts.set_token(TUSHARE_TOKEN)
     
-    # 计算起始日期 (取过去200天以确保有足够数据计算 LLV(90))
+    # 日期范围: 过去 1.5 年 (确保周线有足够数据, 90周 approx 630 days)
     end_date = datetime.datetime.now().strftime('%Y%m%d')
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=250)).strftime('%Y%m%d')
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=SCAN_LOOKBACK_DAYS)).strftime('%Y%m%d')
 
     for i, (index, row) in enumerate(process_list.iterrows()):
         symbol = row['ts_code']
@@ -220,48 +305,55 @@ def run_scanner():
             print(f"Progress: {i}/{len(process_list)}...")
 
         try:
-            # 获取日线数据 (前复权)
-            # ts.pro_bar 整合了复权功能
-            stock_data = ts.pro_bar(ts_code=symbol, adj='qfq', start_date=start_date, end_date=end_date)
+            # --- 日线分析 ---
+            df_daily = ts.pro_bar(ts_code=symbol, adj='qfq', start_date=start_date, end_date=end_date, freq='D')
+            is_buy_d, score_d, info_d = calculate_technical_signals(df_daily)
             
-            if stock_data is None or stock_data.empty:
-                continue
+            # --- 周线分析 ---
+            df_weekly = ts.pro_bar(ts_code=symbol, adj='qfq', start_date=start_date, end_date=end_date, freq='W')
+            is_buy_w, score_w, info_w = calculate_technical_signals(df_weekly)
             
-            # Tushare 返回的数据通常是按日期降序(最新在前)，指标计算通常需要升序(最旧在前)
-            stock_data = stock_data.sort_values('trade_date').reset_index(drop=True)
+            # 构建基础信息字符串
+            base_info = f"- **PE(TTM)**: {row['pe_ttm']}\n- **扣非净利增速**: {row['dt_netprofit_yoy']}%\n"
             
-            # 计算指标
-            is_triggered, signal_val = calculate_indicator(stock_data)
+            if is_buy_d:
+                msg = f"### 🚀 {name} ({symbol})\n{base_info}- 📅 **日线信号**: {info_d}\n---\n"
+                print(f"Found Daily: {name} ({symbol})")
+                daily_picks.append(msg)
+                
+            if is_buy_w:
+                msg = f"### 🚀 {name} ({symbol})\n{base_info}- 📅 **周线信号**: {info_w}\n---\n"
+                print(f"Found Weekly: {name} ({symbol})")
+                weekly_picks.append(msg)
             
-            if is_triggered:
-                # 二次确认：负债率 (如果API支持)
-                # if check_debt_ratio(symbol):
-                res_str = f"【A股】{name} ({symbol}): 主力吸筹值 {signal_val}, PE(TTM) {row['pe_ttm']}"
-                print(f"Found: {res_str}")
-                results.append(res_str)
-            
-            # 礼貌性延时，防止触发 Tushare 频控
-            time.sleep(0.02)
+            time.sleep(0.02) # 避免频控
             
         except Exception as e:
             # print(f"Error processing {symbol}: {e}")
             continue
 
-    return results
+    return daily_picks, weekly_picks
 
 # --- 推送模块 ---
 
 def send_pushplus(content):
     if not PUSHPLUS_TOKEN:
+        print("PushPlus Token is missing. Skipping push notification.")
         return
+    
+    print(f"Sending PushPlus notification... (Token: {PUSHPLUS_TOKEN[:4]}***)")
     url = 'http://www.pushplus.plus/send'
     data = {
         "token": PUSHPLUS_TOKEN,
         "title": f"选股日报 {datetime.date.today()}",
         "content": content,
-        "template": "html"
+        "template": "markdown"
     }
-    requests.post(url, json=data)
+    try:
+        response = requests.post(url, json=data, timeout=10)
+        print(f"PushPlus Response: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"Failed to send PushPlus notification: {e}")
 
 def send_email(content):
     if not (EMAIL_USER and EMAIL_PASS and EMAIL_RECEIVER):
@@ -284,16 +376,27 @@ def send_email(content):
 
 if __name__ == "__main__":
     print("--- Starting Stock Scan ---")
-    final_picks = run_scanner()
+    daily_picks, weekly_picks = run_scanner()
     
-    if final_picks:
-        msg_content = "今日触发【主力吸筹】信号且基本面优秀的股票：<br/><br/>" + "<br/>".join(final_picks)
+    if daily_picks or weekly_picks:
+        # Markdown 头部
+        msg_content = f"# 📈 选股日报 {datetime.date.today()}\n\n"
+        
+        if daily_picks:
+            msg_content += "## ☀️ 日线级别机会\n"
+            msg_content += "".join(daily_picks)
+            msg_content += "\n"
+            
+        if weekly_picks:
+            msg_content += "## 📅 周线级别机会\n"
+            msg_content += "".join(weekly_picks)
+            msg_content += "\n"
+        
         print("Sending notifications...")
         send_pushplus(msg_content)
         
-        # 将 HTML 换行转为文本换行发邮件
-        email_content = msg_content.replace("<br/>", "\n")
-        send_email(email_content)
+        # 邮件发送
+        send_email(msg_content)
     else:
         print("No stocks matched criteria today.")
         # 可选：也发送一个“今日无信号”的通知
