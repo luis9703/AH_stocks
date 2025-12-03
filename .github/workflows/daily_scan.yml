@@ -1,0 +1,36 @@
+name: Daily Stock Scanner
+
+on:
+  schedule:
+    # Cron 语法: 分 时 日 月 周
+    # UTC时间 01:00 对应 北京时间 09:00 (冬令时可能需要调整为 0:00 或 2:00，通常误差1小时不影响选股)
+    - cron: '0 1 * * 1-5'
+  workflow_dispatch: # 允许手动点击按钮触发测试
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run Stock Scanner
+      env:
+        # 这里引用我们在 Settings 里设置的密码
+        PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        EMAIL_USER: ${{ secrets.EMAIL_USER }}
+        EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+        EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+      run: |
+        python stock_scanner.py
