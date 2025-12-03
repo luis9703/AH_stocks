@@ -23,17 +23,17 @@ pro = ts.pro_api()
 
 # Backtest Parameters (回测参数)
 # 回测时间范围：过去3年到今天
-START_DATE = (datetime.datetime.now() - datetime.timedelta(days=365*5)).strftime('%Y%m%d')
+START_DATE = (datetime.datetime.now() - datetime.timedelta(days=365*8)).strftime('%Y%m%d')
 END_DATE = datetime.datetime.now().strftime('%Y%m%d')
-INITIAL_CASH = 2000000       # 初始资金 200万
+INITIAL_CASH = 1000000       # 初始资金 100万
 MAX_POSITIONS = 5           # 最大持仓股票数量
-POSITION_SIZE_PCT = 0.20     # 单只股票仓位占比 5%
+POSITION_SIZE_PCT = 0.20     # 单只股票仓位占比 20%
 HOLD_DAYS = 45               # 持仓天数
 
 # Stock Filter Parameters (选股过滤参数)
 FILTER_MIN_MARKET_CAP = 400 * 10000 * 10000  # 最小市值 400亿
-FILTER_MIN_PE = 5           # 最小市盈率(TTM)
-FILTER_MAX_PE = 90           # 最大市盈率(TTM)
+FILTER_MIN_PE = 20           # 最小市盈率(TTM)
+FILTER_MAX_PE = 45           # 最大市盈率(TTM)
 FILTER_MIN_PROFIT_YOY = -20  # 净利润同比增长率下限 (%)
 # FILTER_FINANCIAL_PERIOD removed - will be dynamic (财务周期动态获取)
 
@@ -43,7 +43,12 @@ BUY_WEIGHTS = {'s1_main': 0.40, 's2_risk': 0.35, 's3_momentum': 0.25}
 BUY_THRESHOLD = 90           # 买入总分阈值
 STOP_LOSS_PCT = -0.10        # 止损百分比 (-10%)
 TAKE_PROFIT_PCT = 0.25       # 止盈百分比 (25%)
-COOLDOWN_DAYS = 10           # 卖出后冷却天数 (禁止买入刚卖出的股票)
+COOLDOWN_DAYS = 15           # 卖出后冷却天数 (禁止买入刚卖出的股票)
+
+# Transaction Cost Parameters (交易成本参数)
+COMMISSION_RATE = 0.0003     # 买卖佣金 0.03%
+STAMP_DUTY_RATE = 0.001      # 卖出印花税 0.1%
+SLIPPAGE_RATE = 0.002        # 滑点 0.2% (双向)
 
 # Chart Parameters (图表参数)
 CHART_FONT_SIZE_TITLE = 20
@@ -210,7 +215,8 @@ def get_stock_pool(target_date, period):
              print(f"Warning: No daily basic data for {last_trade_date}")
              return [], {}
 
-        df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name')
+        # Fetch market info to ensure coverage of Main, ChiNext, STAR
+        df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,market')
         df = pd.merge(df_daily, df_basic, on='ts_code')
         
         # 过滤: 市值 & PE
@@ -220,7 +226,14 @@ def get_stock_pool(target_date, period):
             (df['pe_ttm'] <= FILTER_MAX_PE)
         ].copy()
         
+        print(f"  > After Market Cap & PE filter: {len(subset)}")
+        # Print Market Distribution
+        market_counts = subset['market'].value_counts()
+        print(f"  > Market Distribution: {market_counts.to_dict()}")
+
         # 3. 财务过滤 (净利润增长率 > 0) 针对特定财报周期
+        # Note: dt_netprofit_yoy in fina_indicator usually refers to Deducted Net Profit YoY (Accumulated/YTD for the period)
+        # 这里的 dt_netprofit_yoy 指的是扣非净利润同比增长率 (期末累计值，即YTD)
         codes = subset['ts_code'].tolist()
         if not codes:
             return [], {}
@@ -230,13 +243,24 @@ def get_stock_pool(target_date, period):
         
         if not df_fina.empty:
             subset = pd.merge(subset, df_fina, on='ts_code', how='inner')
+            print(f"  > After merging financial data: {len(subset)}")
             subset = subset[subset['dt_netprofit_yoy'] > FILTER_MIN_PROFIT_YOY]
+            print(f"  > After Profit YoY filter: {len(subset)}")
             
         # 去重
         subset.drop_duplicates(subset=['ts_code'], inplace=True)
 
-        print(f"  > Pool size: {len(subset)}")
-        return subset['ts_code'].tolist(), dict(zip(subset['ts_code'], subset['name']))
+        print(f"  > Final Pool size: {len(subset)}")
+        # Return list of codes and dict of info (name, market)
+        info_dict = {}
+        for _, row in subset.iterrows():
+            info_dict[row['ts_code']] = {'name': row['name'], 'market': row['market']}
+            
+        return subset['ts_code'].tolist(), info_dict
+        
+    except Exception as e:
+        print(f"Error fetching pool for {target_date}: {e}")
+        return [], {}
         
     except Exception as e:
         print(f"Error fetching pool for {target_date}: {e}")
@@ -308,11 +332,11 @@ def run_backtest():
             seen_dates.add(s['date'])
     
     # 获取每个调仓日的股票池
-    stock_name_map = {}
+    stock_info_map = {} # code -> {'name': name, 'market': market}
     for item in unique_schedule:
-        codes, names = get_stock_pool(item['date'], item['period'])
+        codes, infos = get_stock_pool(item['date'], item['period'])
         pool_map[item['date']] = codes
-        stock_name_map.update(names)
+        stock_info_map.update(infos)
         all_involved_stocks.update(codes)
         time.sleep(0.5) # 避免触发接口限流
         
@@ -426,20 +450,48 @@ def run_backtest():
                         reason = 'Take Profit (Intraday)'
                 
                 if triggered:
-                    revenue = pos['shares'] * sell_price
-                    cash += revenue
+                    # Apply Slippage to Sell Price (卖出滑点)
+                    # Sell Price decreases by slippage
+                    actual_sell_price = sell_price * (1 - SLIPPAGE_RATE)
                     
-                    profit_rate = (sell_price - pos['buy_price']) / pos['buy_price']
-                    profit_amount = revenue - (pos['shares'] * pos['buy_price'])
+                    revenue = pos['shares'] * actual_sell_price
+                    
+                    # Transaction Costs (交易成本)
+                    commission = revenue * COMMISSION_RATE
+                    stamp_duty = revenue * STAMP_DUTY_RATE
+                    total_cost = commission + stamp_duty
+                    
+                    net_revenue = revenue - total_cost
+                    cash += net_revenue
+                    
+                    # Calculate Profit based on Net Revenue vs Cost (including buy costs)
+                    # Note: pos['cost'] should ideally store the total cost including buy commission.
+                    # But currently pos['buy_price'] is raw price. 
+                    # Let's calculate raw profit for reference, but net profit for account.
+                    # To be precise, we should store 'total_buy_cost' in positions.
+                    # For now, let's approximate or update buy logic to store cost.
+                    # Let's assume we update buy logic later.
+                    # Here we calculate profit as (Net Revenue - (Shares * Buy Price)) - Buy Commission?
+                    # Better: Net Revenue - Initial Cost (which includes buy commission)
+                    
+                    # We need to update Buy Logic to store 'total_cost'
+                    initial_cost = pos.get('total_cost', pos['shares'] * pos['buy_price'])
+                    
+                    profit_amount = net_revenue - initial_cost
+                    profit_rate = profit_amount / initial_cost
                     
                     trades.append({
                         'date': current_date,
                         'code': code,
                         'name': pos.get('name', code),
                         'action': 'SELL',
-                        'price': sell_price,
+                        'price': sell_price, # Log raw price
+                        'exec_price': round(actual_sell_price, 2),
                         'shares': pos['shares'],
-                        'amount': revenue,
+                        'amount': round(revenue, 2),
+                        'commission': round(commission, 2),
+                        'tax': round(stamp_duty, 2),
+                        'net_amount': round(net_revenue, 2),
                         'pos_pct': f"{pos.get('pos_pct', 0)*100:.1f}%",
                         'profit_amount': round(float(profit_amount), 2),
                         'profit': f"{profit_rate*100:.1f}%",
@@ -533,30 +585,45 @@ def run_backtest():
                         if np.isnan(buy_price): continue
                         
                         # Calculate shares (round to 100) (计算股数，向下取整到100股)
-                        shares = int(buy_amt / buy_price / 100) * 100
+                        # Adjust buy_price for slippage to check affordability
+                        est_buy_price = buy_price * (1 + SLIPPAGE_RATE)
+                        shares = int(buy_amt / est_buy_price / 100) * 100
                         
-                        if shares > 0 and cash >= shares * buy_price:
-                            cost = shares * buy_price
-                            cash -= cost
+                        if shares > 0:
+                            # Calculate actual costs
+                            actual_buy_price = buy_price * (1 + SLIPPAGE_RATE)
+                            raw_cost = shares * actual_buy_price
+                            commission = raw_cost * COMMISSION_RATE
+                            total_cost = raw_cost + commission
                             
+                            if cash >= total_cost:
+                                cash -= total_cost
+                                
                             # Estimate equity for logging
-                            pos_pct = cost / current_total_equity if current_total_equity > 0 else 0
+                            pos_pct = total_cost / current_total_equity if current_total_equity > 0 else 0
                             
+                            stock_info = stock_info_map.get(code, {'name': code, 'market': 'Unknown'})
                             positions[code] = {
                                 'shares': shares,
                                 'buy_date': current_date,
-                                'buy_price': buy_price,
-                                'name': stock_name_map.get(code, code),
+                                'buy_price': buy_price, # Store raw price for reference
+                                'total_cost': total_cost, # Store total cost for profit calc
+                                'name': stock_info['name'],
+                                'market': stock_info['market'],
                                 'pos_pct': pos_pct
                             }
                             trades.append({
                                 'date': current_date,
                                 'code': code,
-                                'name': stock_name_map.get(code, code),
+                                'name': stock_info['name'],
+                                'market': stock_info['market'],
                                 'action': 'BUY',
                                 'price': buy_price,
+                                'exec_price': round(actual_buy_price, 2),
                                 'shares': shares,
-                                'amount': cost,
+                                'amount': round(raw_cost, 2),
+                                'commission': round(commission, 2),
+                                'total_cost': round(total_cost, 2),
                                 'pos_pct': f"{pos_pct*100:.1f}%",
                                 'score': cand['score']
                             })
@@ -598,25 +665,40 @@ def run_backtest():
                     if isinstance(sell_price, pd.Series):
                         sell_price = sell_price.iloc[0]
                     
-                    revenue = pos['shares'] * sell_price
-                    cash += revenue
+                    # Apply Slippage
+                    actual_sell_price = sell_price * (1 - SLIPPAGE_RATE)
+                    revenue = pos['shares'] * actual_sell_price
                     
-                    profit_rate = (sell_price - pos['buy_price']) / pos['buy_price']
-                    profit_amount = revenue - (pos['shares'] * pos['buy_price'])
+                    # Transaction Costs
+                    commission = revenue * COMMISSION_RATE
+                    stamp_duty = revenue * STAMP_DUTY_RATE
+                    total_cost = commission + stamp_duty
+                    
+                    net_revenue = revenue - total_cost
+                    cash += net_revenue
+                    
+                    initial_cost = pos.get('total_cost', pos['shares'] * pos['buy_price'])
+                    profit_amount = net_revenue - initial_cost
+                    profit_rate = profit_amount / initial_cost
                     
                     trades.append({
                         'date': current_date,
                         'code': code,
                         'name': pos.get('name', code),
+                        'market': pos.get('market', 'Unknown'),
                         'action': 'SELL',
                         'price': sell_price,
+                        'exec_price': round(actual_sell_price, 2),
                         'shares': pos['shares'],
-                        'amount': revenue,
+                        'amount': round(revenue, 2),
+                        'commission': round(commission, 2),
+                        'tax': round(stamp_duty, 2),
+                        'net_amount': round(net_revenue, 2),
                         'pos_pct': f"{pos.get('pos_pct', 0)*100:.1f}%",
                         'profit_amount': round(float(profit_amount), 2),
                         'profit': f"{profit_rate*100:.1f}%",
                         'held_days': held_days,
-                        'reason': f'Held {held_days} days'
+                        'reason': reason
                     })
                     
                     # Record sell date for cooldown
@@ -659,18 +741,31 @@ def run_backtest():
              else:
                  last_price = df.iloc[-1]['C']
         
-        profit_rate = (last_price - pos['buy_price']) / pos['buy_price']
-        market_val = pos['shares'] * last_price
-        profit_amount = market_val - (pos['shares'] * pos['buy_price'])
+        # Apply Slippage & Costs for hypothetical liquidation
+        actual_sell_price = last_price * (1 - SLIPPAGE_RATE)
+        revenue = pos['shares'] * actual_sell_price
+        commission = revenue * COMMISSION_RATE
+        stamp_duty = revenue * STAMP_DUTY_RATE
+        total_cost = commission + stamp_duty
+        net_revenue = revenue - total_cost
+        
+        initial_cost = pos.get('total_cost', pos['shares'] * pos['buy_price'])
+        profit_amount = net_revenue - initial_cost
+        profit_rate = profit_amount / initial_cost
         
         trades.append({
             'date': trade_dates[-1],
             'code': code,
             'name': pos.get('name', code),
+            'market': pos.get('market', 'Unknown'),
             'action': 'HELD_END',
             'price': last_price,
+            'exec_price': round(actual_sell_price, 2),
             'shares': pos['shares'],
-            'amount': market_val,
+            'amount': round(revenue, 2),
+            'commission': round(commission, 2),
+            'tax': round(stamp_duty, 2),
+            'net_amount': round(net_revenue, 2),
             'pos_pct': f"{pos.get('pos_pct', 0)*100:.1f}%",
             'profit_amount': round(float(profit_amount), 2),
             'profit': f"{profit_rate*100:.1f}%",
@@ -851,6 +946,86 @@ def run_backtest():
     if not df_trades.empty:
         df_trades.to_csv('backtest_trades.csv', index=False)
         print("Trades saved to backtest_trades.csv")
+        
+        # --- Detailed Analysis (详细分析) ---
+        analyze_trades(df_trades)
+
+def analyze_trades(df_trades):
+    """
+    Analyze trade history and print detailed statistics.
+    """
+    print("\n" + "="*40)
+    print("          DETAILED TRADE ANALYSIS          ")
+    print("="*40)
+    
+    if df_trades.empty:
+        print("No trades to analyze.")
+        return
+
+    # Filter for closed trades (SELL or HELD_END)
+    closed_trades = df_trades[df_trades['action'].isin(['SELL', 'HELD_END'])].copy()
+    if closed_trades.empty:
+        print("No closed trades.")
+        return
+        
+    closed_trades['profit_float'] = closed_trades['profit'].str.rstrip('%').astype(float) / 100
+    closed_trades['year'] = pd.to_datetime(closed_trades['date']).dt.year
+    
+    # 1. Analysis by Year (按年份分析)
+    print("\n--- Performance by Year ---")
+    yearly_stats = closed_trades.groupby('year').agg({
+        'profit_amount': 'sum',
+        'profit_float': 'mean',
+        'code': 'count'
+    }).rename(columns={'code': 'trades', 'profit_float': 'avg_return'})
+    
+    # Calculate Win Rate by Year
+    yearly_wins = closed_trades[closed_trades['profit_float'] > 0].groupby('year')['code'].count()
+    yearly_stats['win_rate'] = (yearly_wins / yearly_stats['trades']).fillna(0)
+    
+    # Format output
+    print(f"{'Year':<6} | {'Trades':<6} | {'Win Rate':<8} | {'Avg Return':<10} | {'Total Profit':<12}")
+    print("-" * 55)
+    for year, row in yearly_stats.iterrows():
+        print(f"{year:<6} | {int(row['trades']):<6} | {row['win_rate']*100:6.1f}% | {row['avg_return']*100:9.2f}% | {row['profit_amount']:12,.2f}")
+
+    # 2. Analysis by Sell Reason (按卖出原因分析)
+    print("\n--- Performance by Exit Reason ---")
+    reason_stats = closed_trades.groupby('reason').agg({
+        'profit_amount': 'sum',
+        'profit_float': 'mean',
+        'code': 'count'
+    }).rename(columns={'code': 'trades', 'profit_float': 'avg_return'})
+    
+    print(f"{'Reason':<25} | {'Trades':<6} | {'Avg Return':<10} | {'Total Profit':<12}")
+    print("-" * 60)
+    for reason, row in reason_stats.iterrows():
+        print(f"{reason:<25} | {int(row['trades']):<6} | {row['avg_return']*100:9.2f}% | {row['profit_amount']:12,.2f}")
+
+    # 3. Analysis by Market (按板块分析)
+    if 'market' in closed_trades.columns:
+        print("\n--- Performance by Market ---")
+        market_stats = closed_trades.groupby('market').agg({
+            'profit_amount': 'sum',
+            'profit_float': 'mean',
+            'code': 'count'
+        }).rename(columns={'code': 'trades', 'profit_float': 'avg_return'})
+        
+        print(f"{'Market':<10} | {'Trades':<6} | {'Avg Return':<10} | {'Total Profit':<12}")
+        print("-" * 50)
+        for market, row in market_stats.iterrows():
+            print(f"{market:<10} | {int(row['trades']):<6} | {row['avg_return']*100:9.2f}% | {row['profit_amount']:12,.2f}")
+
+    # 4. Top Winners & Losers (最佳/最差个股)
+    print("\n--- Top 5 Profitable Trades ---")
+    top_winners = closed_trades.nlargest(5, 'profit_float')
+    for _, row in top_winners.iterrows():
+        print(f"{row['date'].date()} {row['code']} {row['name']} ({row['market']}): {row['profit']} ({row['profit_amount']:,.0f}) [{row['reason']}]")
+        
+    print("\n--- Top 5 Loss Trades ---")
+    top_losers = closed_trades.nsmallest(5, 'profit_float')
+    for _, row in top_losers.iterrows():
+        print(f"{row['date'].date()} {row['code']} {row['name']} ({row['market']}): {row['profit']} ({row['profit_amount']:,.0f}) [{row['reason']}]")
 
 if __name__ == "__main__":
     run_backtest()
