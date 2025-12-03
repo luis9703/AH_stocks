@@ -1,4 +1,5 @@
 import akshare as ak
+import tushare as ts
 import pandas as pd
 import numpy as np
 import datetime
@@ -8,8 +9,20 @@ from email.header import Header
 import requests
 import os
 import time
+import warnings
+
+# 忽略 FutureWarning
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# 尝试禁用系统代理，防止网络请求被拦截
+os.environ['http_proxy'] = ''
+os.environ['https_proxy'] = ''
+os.environ['all_proxy'] = ''
 
 # --- 配置区域 (推荐通过环境变量注入，保证安全) ---
+# Tushare Token
+TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "ac85143eaf1a537517703687c0596b2a303696345e0162612af7ca9d") # 请替换为你的 Tushare Token
+
 # 微信推送 (PushPlus)
 PUSHPLUS_TOKEN = os.environ.get("7b4ee9c6a01c42009c59e7b1e193b108")  # 你的PushPlus Token
 
@@ -120,40 +133,50 @@ def calculate_indicator(df):
 # --- 数据获取与筛选 ---
 
 def get_a_stocks():
-    """获取A股列表并进行基本面初筛"""
-    print("Fetching A-share fundamental data...")
+    """获取A股列表并进行基本面初筛 (Tushare版)"""
+    print("Fetching A-share fundamental data via Tushare...")
     
-    # --- 新增：重试机制 ---
-    # GitHub Actions 在海外，连接国内接口容易断开，增加重试可以大幅提高稳定性
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            # 获取实时行情，包含总市值、PE、PB等
-            df = ak.stock_zh_a_spot_em()
+    try:
+        ts.set_token(TUSHARE_TOKEN)
+        pro = ts.pro_api()
+        
+        # 1. 获取最新交易日
+        # 获取过去30天内的交易日历，取最后一个
+        today = datetime.datetime.now().strftime('%Y%m%d')
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime('%Y%m%d')
+        cal = pro.trade_cal(exchange='', start_date=start_date, end_date=today, is_open='1')
+        
+        if cal.empty:
+            print("No trade calendar found.")
+            return pd.DataFrame()
             
-            # 过滤条件
-            # 1. 市值 > 200亿 (总市值字段通常是 '总市值')
-            # 2. 5 < PE(TTM) < 100 (字段: '市盈率-动态')
-            
-            subset = df[
-                (df['总市值'] >= MIN_MARKET_CAP) & 
-                (df['市盈率-动态'] >= MIN_PE) & 
-                (df['市盈率-动态'] <= MAX_PE)
-            ].copy()
-            
-            print(f"A-shares passed fundamental filter (Cap & PE): {len(subset)}")
-            return subset
+        last_trade_date = cal.iloc[-1]['cal_date']
+        print(f"Latest trade date: {last_trade_date}")
 
-        except Exception as e:
-            print(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
-            if attempt < max_retries - 1:
-                wait_time = 15  # 失败后等待15秒再试
-                print(f"Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-            else:
-                print("Max retries reached. Failed to fetch A-share list.")
-                # 如果彻底失败，返回空DataFrame，避免脚本崩溃
-                return pd.DataFrame()
+        # 2. 获取每日指标 (PE, 市值)
+        # total_mv 单位是万元
+        df_daily = pro.daily_basic(ts_code='', trade_date=last_trade_date, fields='ts_code,pe_ttm,total_mv')
+        
+        # 3. 获取股票基础信息 (名称)
+        df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name')
+        
+        # 4. 合并
+        df = pd.merge(df_daily, df_basic, on='ts_code')
+        
+        # 5. 过滤
+        # MIN_MARKET_CAP 是绝对值(元)，total_mv 是万元，所以 total_mv * 10000
+        subset = df[
+            (df['total_mv'] * 10000 >= MIN_MARKET_CAP) & 
+            (df['pe_ttm'] >= MIN_PE) & 
+            (df['pe_ttm'] <= MAX_PE)
+        ].copy()
+        
+        print(f"A-shares passed fundamental filter (Cap & PE): {len(subset)}")
+        return subset
+
+    except Exception as e:
+        print(f"Failed to fetch A-share list from Tushare: {e}")
+        return pd.DataFrame()
 
 def check_financials(symbol):
     """
@@ -173,20 +196,39 @@ def run_scanner():
     # 1. 获取 A 股符合基本面的列表
     a_stocks = get_a_stocks()
     
-    # 2. 遍历列表获取K线并计算 (限制数量防止Demo运行过久，实际部署去掉head)
-    # 为了演示，我们只跑前 10 个符合基本面的，部署时请去掉 .head(10)
-    process_list = a_stocks # .head(10) 
+    if a_stocks.empty:
+        print("No stocks found in fundamental scan.")
+        return []
+
+    # 2. 遍历列表获取K线并计算
+    process_list = a_stocks
     
     print(f"Starting technical scan for {len(process_list)} stocks...")
     
-    for index, row in process_list.iterrows():
-        symbol = row['代码']
-        name = row['名称']
+    # 准备 Tushare 接口
+    ts.set_token(TUSHARE_TOKEN)
+    
+    # 计算起始日期 (取过去200天以确保有足够数据计算 LLV(90))
+    end_date = datetime.datetime.now().strftime('%Y%m%d')
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=250)).strftime('%Y%m%d')
+
+    for i, (index, row) in enumerate(process_list.iterrows()):
+        symbol = row['ts_code']
+        name = row['name']
         
+        if i % 50 == 0:
+            print(f"Progress: {i}/{len(process_list)}...")
+
         try:
             # 获取日线数据 (前复权)
-            # period='daily', adjust='qfq'
-            stock_data = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq")
+            # ts.pro_bar 整合了复权功能
+            stock_data = ts.pro_bar(ts_code=symbol, adj='qfq', start_date=start_date, end_date=end_date)
+            
+            if stock_data is None or stock_data.empty:
+                continue
+            
+            # Tushare 返回的数据通常是按日期降序(最新在前)，指标计算通常需要升序(最旧在前)
+            stock_data = stock_data.sort_values('trade_date').reset_index(drop=True)
             
             # 计算指标
             is_triggered, signal_val = calculate_indicator(stock_data)
@@ -194,12 +236,12 @@ def run_scanner():
             if is_triggered:
                 # 二次确认：负债率 (如果API支持)
                 # if check_debt_ratio(symbol):
-                res_str = f"【A股】{name} ({symbol}): 主力吸筹值 {signal_val}, PE(TTM) {row['市盈率-动态']}"
+                res_str = f"【A股】{name} ({symbol}): 主力吸筹值 {signal_val}, PE(TTM) {row['pe_ttm']}"
                 print(f"Found: {res_str}")
                 results.append(res_str)
             
-            # 礼貌性延时，防止被封IP
-            time.sleep(0.1)
+            # 礼貌性延时，防止触发 Tushare 频控
+            time.sleep(0.02)
             
         except Exception as e:
             # print(f"Error processing {symbol}: {e}")
@@ -255,3 +297,4 @@ if __name__ == "__main__":
     else:
         print("No stocks matched criteria today.")
         # 可选：也发送一个“今日无信号”的通知
+        send_pushplus("今日无符合条件的股票信号。")
